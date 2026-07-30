@@ -1,0 +1,179 @@
+# Reviewer — reports, never edits. The human decides what happens next.
+#
+# WHY NOT ON EVERY PUSH
+# =====================
+# Triggers are: PR opened, PR marked ready, and the `ai:review` label.
+# Deliberately NO `synchronize`: on an active repository a review after every
+# push costs more than it is worth, and you rarely want an opinion on work that
+# is half finished. Re-running is one click on a label.
+#
+# WHY THERE IS NO LOOP
+# ====================
+# The fixer agent runs on the default `GITHUB_TOKEN`, and events caused by that
+# token do not start new workflow runs — a built-in GitHub guard against
+# recursion. So the fixer's push will NOT wake this review, which is the point.
+# Nothing spirals on its own, because every further round needs a human.
+
+name: Claude — review PR
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+  # claude-code-action fetches an OIDC token. Without this it fails with
+  # "Could not fetch an OIDC token" before ever reaching the model.
+  id-token: write
+
+jobs:
+  review:
+    if: |
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' ||
+       contains(fromJSON('["ai:review","ai:review-opus"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pick the model
+        id: model
+        run: |
+          if [ "${{ github.event.label.name }}" = "ai:review-opus" ]; then
+            echo "id=claude-opus-5" >> "$GITHUB_OUTPUT"
+          else
+            echo "id=claude-sonnet-5" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # Full history — the reviewer needs the base to compute a diff.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Review
+        uses: anthropics/claude-code-action@v1
+        with:
+          # A subscription token (`claude setup-token`) or an API key. A
+          # subscription draws on the same limits your own terminal uses; an API
+          # key bills separately and can never throttle your own work.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # PASSED EXPLICITLY, and that matters: without it the action tries to
+          # exchange a token through the Claude GitHub App and fails with
+          # "401 Unauthorized — Claude Code is not installed on this repository".
+          github_token: ${{ github.token }}
+          # NO SPACES inside --allowedTools. A value like `Bash(git diff:*)`
+          # splits on the space and the whole list arrives empty, which means
+          # "nothing is allowed" — every tool call is then denied.
+          claude_args: |
+            --model ${{ steps.model.outputs.id }}
+            --max-turns 30
+            --allowedTools Read,Glob,Grep,Write,Bash(git:*)
+          prompt: |
+            You are reviewing PR #${{ github.event.pull_request.number }}.
+            Target branch: ${{ github.event.pull_request.base.ref }}.
+
+            Review ONLY the changes in this PR:
+            `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD`
+
+            Look for things that will actually break in production:
+            - logic errors and edge cases that fall over on real data
+            - security: unvalidated input, string-concatenated queries, leaked secrets
+            - regressions in whatever this codebase treats as a critical path
+            - silently swallowed errors (`try {} catch {}` with no logging)
+            Skip style, formatting and naming preferences — linters handle those.
+
+            Every finding MUST come with a concrete failure scenario: what input
+            leads to what bad outcome. If you cannot state one, it is not a
+            finding — leave it out. An empty list beats a list of guesses.
+
+            NUMBER your findings (1., 2., 3.) — a human will refer to them by
+            number when asking for fixes.
+
+            DO NOT try to comment on the PR with a tool. You do not have access
+            and you will burn turns discovering that. Write THREE FILES in the
+            repository root instead:
+
+            `.agent-verdict` — exactly one word: PASS or FAIL
+
+            `.agent-review.md` — the review itself, in Markdown. If you found
+            nothing, say so in one sentence.
+
+            `.agent-notes.json` — findings pinned to SPECIFIC LINES, so a human
+            sees them in the file view rather than only in the conversation.
+            Format — an array of objects, each exactly like this:
+              [{"path":"src/file.js","line":42,"side":"RIGHT","body":"..."}]
+            Rules that decide whether a note shows up at all:
+            - `line` MUST be a line number visible in this PR's diff
+            - `side` is "RIGHT" for added and changed lines, "LEFT" for removed
+            - if a finding has no single line, do NOT force it here — describe
+              it in `.agent-review.md`
+            - no findings means an empty array `[]`
+
+            The workflow publishes these as a formal review with inline
+            comments. Your job ends when the files are written.
+
+      - name: Publish the review
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Publishing needs no model — it is a plain API call. Keeping it out of
+          # the agent saves turns (money) and removes a whole class of tool
+          # permission failures.
+          if [ -s .agent-review.md ]; then
+            # A formal REVIEW, not an issue comment: this way the agent appears
+            # among the PR's reviewers, and notes from `.agent-notes.json` land
+            # next to the lines they refer to.
+            [ -s .agent-notes.json ] || echo '[]' > .agent-notes.json
+            jq -n --rawfile body .agent-review.md --slurpfile notes .agent-notes.json \
+              '{event:"COMMENT", body:$body, comments:($notes[0] // [])}' > /tmp/review.json
+
+            count=$(jq 'length' .agent-notes.json)
+            if gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
+                 --input /tmp/review.json >/dev/null 2>&1; then
+              echo "✓ review published ($count inline notes)"
+            else
+              # Most common cause: a line number outside the diff. Do NOT lose the
+              # review over it — publish the body without the pins.
+              echo "⚠ API rejected the inline notes (most likely a line outside the diff)"
+              jq -n --rawfile body .agent-review.md '{event:"COMMENT", body:$body}' > /tmp/review2.json
+              gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
+                --input /tmp/review2.json >/dev/null
+              echo "✓ review published without inline pins"
+            fi
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body \
+              "**The reviewer produced no review.** The run finished without a \`.agent-review.md\` — see the [run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The status check is red, because a missing review must not open the way forward."
+            echo "✗ no review file"
+          fi
+
+      - name: Set the agent-review status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # No file means the agent did not finish. Treat that as FAIL, never as
+          # PASS — not knowing must not open the way to production.
+          if [ -f .agent-verdict ] && grep -qx 'PASS' .agent-verdict; then
+            state=success; desc="Review found no blocking problems"
+          else
+            state=failure; desc="Review raised findings, or did not finish"
+          fi
+          gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+            -f state="$state" -f context="agent-review" -f description="$desc"
+
+      - name: Drop the label so it can be clicked again
+        if: always() && github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ github.event.label.name }}" \
+            2>/dev/null || true

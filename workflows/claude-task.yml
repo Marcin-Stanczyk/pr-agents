@@ -1,0 +1,93 @@
+# Task agent — "go and do this" from an issue.
+#
+# Sonnet by default; the `ai:opus` label switches to Opus. The result is a PR,
+# never a direct push, so every change an agent makes goes through the same
+# review path as a human's.
+#
+# CONFIGURE THIS: set BASE_BRANCH to whatever your repository develops on.
+
+name: Claude — task from issue
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-task-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  # Without this the action fails with "Could not fetch an OIDC token".
+  id-token: write
+
+env:
+  BASE_BRANCH: main
+
+jobs:
+  run:
+    # Two deliberate triggers — the agent never starts on its own:
+    #   1. the `ai:task` label   2. `@claude` in a comment
+    # The `author_association` check is a safeguard, not a formality: without it
+    # an outsider's issue text would be steering an agent with write access.
+    if: |
+      (github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'ai:task')) ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.BASE_BRANCH }}
+
+      - name: Pick the model
+        id: model
+        run: |
+          set -euo pipefail
+          if [ "${{ contains(github.event.issue.labels.*.name, 'ai:opus') }}" = "true" ]; then
+            echo "id=claude-opus-5" >> "$GITHUB_OUTPUT"
+          else
+            echo "id=claude-sonnet-5" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Do the task
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          # No spaces inside --allowedTools, or the whole list arrives empty.
+          claude_args: |
+            --model ${{ steps.model.outputs.id }}
+            --max-turns 60
+            --allowedTools Read,Glob,Grep,Write,Edit,Bash(git:*),Bash(gh:*)
+          prompt: |
+            Carry out the task described in issue #${{ github.event.issue.number }}.
+            You are based on `${{ env.BASE_BRANCH }}`.
+
+            Read any contributor guide or agent instructions in this repository
+            (CLAUDE.md, AGENTS.md, CONTRIBUTING.md) and follow them strictly.
+
+            How to work:
+            - Create a branch `agent/<short-description>` and work there.
+            - Never `git add -A` or `git commit -a` — always explicit paths.
+            - Do what was asked and nothing more. No refactoring on the side, no
+              speculative abstractions, no handling for cases that cannot occur.
+            - If the task is ambiguous enough that two sensible readings lead to
+              different work, do not guess. Post a comment with the question and
+              stop.
+            - If something cannot be finished, do the rest and say plainly what is
+              missing and why. Do not report a half-done job as done.
+
+            Finish by opening a PR against `${{ env.BASE_BRANCH }}` describing WHAT
+            you changed and WHY, and how to check it. Link the issue.
+
+            Add this line at the end of the PR body:
+            `_Review: apply the **ai:review** label._`
+            The review will NOT start on its own — PRs created by automation do
+            not trigger further workflows (a `GITHUB_TOKEN` limitation), so a
+            human starts it with one click.

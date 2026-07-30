@@ -1,4 +1,4 @@
-# claude-pr-agents
+# pr-agents
 
 Three GitHub Actions workflows that put Claude on your pull requests: **a
 reviewer, a fixer and a task agent** — each started deliberately, none of them
@@ -10,6 +10,10 @@ cp workflows/*.yml .github/workflows/
 ```
 
 Plus one repository secret. Details below.
+
+The name is provider-neutral on purpose; the current implementation is built on
+[`claude-code-action`](https://github.com/anthropics/claude-code-action), which is
+why the workflow files say `claude-`.
 
 ---
 
@@ -47,9 +51,9 @@ If you use an API key, swap `claude_code_oauth_token:` for
 `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}` in all three files.
 
 **Which to pick:** if you are already bumping into your subscription's weekly
-limits, use the API key. A correctly configured review costs roughly \$0.18 —
-paying that separately buys certainty that an agent can never block your own
-work mid-task.
+limits, use the API key. A correctly configured review cost roughly \$0.18 when
+measured on 2026-07-30 — paying that separately buys certainty that an agent can
+never block your own work mid-task.
 
 **3. Copy the workflows and create the labels.**
 
@@ -145,8 +149,12 @@ is allowed to run. That is a stronger guarantee than an allowlist pattern.
 
 ## Cost
 
+**All figures measured 2026-07-30.** Model prices change — treat them as an order
+of magnitude, not a quote, and re-measure before budgeting.
+
 Measured on a real repository, Sonnet, one-file PR: **6 turns, 53 seconds, \$0.18
-equivalent.** A large PR costs several times that; Opus roughly 2.5× Sonnet.
+equivalent.** A large PR costs several times that; Opus roughly 2.5× Sonnet, based
+on list prices on that date.
 
 GitHub Actions minutes are effectively free at this scale — a run takes a few
 minutes against an allowance of thousands.

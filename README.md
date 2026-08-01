@@ -67,19 +67,61 @@ not develop on `main`.
 
 ## The design, and why it is this way
 
-### There is no automatic loop, on purpose
+### The loop is bounded, and the bound is the point
 
-The obvious next idea is a loop: reviewer finds problems → fixer fixes them →
-reviewer checks again. We built that and then removed it.
+Reviewer finds problems → fixer fixes them → reviewer checks again. The obvious
+idea, and it works — but only with a hard stop attached.
 
-**Events caused by `GITHUB_TOKEN` do not start new workflow runs.** That is a
-GitHub guard against a workflow triggering itself forever. So the fixer's push
-does not wake the reviewer, and a real loop needs your own GitHub App to get past
-that guard — at which point you have *disabled the safety mechanism* and have to
-write your own round counter to replace it.
+**Events caused by `GITHUB_TOKEN` do not start new workflow runs.** That is
+GitHub's guard against a workflow triggering itself forever. So the fixer's push
+does not wake the reviewer on its own; the loop has to be driven from one job,
+which is also where its limits live:
 
-That complexity only pays off once you trust the reviews. Until then, every round
-costs money, so every round should be a decision. **You are the loop.**
+- **three fix rounds, four reviews**, then it stops whatever the verdict is;
+- it stops early **when a round stops making progress** — if the next review
+  returns as many findings as the last one, or more, another round will not help;
+- **rounds two and later are incremental**: they read the diff of the fixes, not
+  the whole PR again. Cheaper, and it keeps the reviewer's attention on what
+  actually changed.
+
+Two rounds is not a tuning choice, it is the minimum that is safe. Read the next
+section for why.
+
+### Always read the `fix(review):` commits before merging
+
+On the first real run, the fixer removed a status prefix from an order query and
+**silently disabled a payment gate** — the guard that stops a deploy while
+customers are mid-transaction. The change looked entirely reasonable in the diff.
+Round two caught it and put the prefix back.
+
+Had the limit been one fix round, that PR would have carried a broken payment
+gate with a green verdict on top. The loop found its own mistake because it was
+allowed a second look — not because the fixer was careful.
+
+So: a green `agent-review` means *the reviewer had no further objections*. It does
+not mean the fixes were good. Read them.
+
+### A PASS can describe a fix that is not in the tree
+
+Worse than a wrong finding, and harder to notice. A review came back green,
+quoting the corrected line and explaining why it was now right — quotes were
+balanced, escaping correct, semantics matching the condition used above it. All
+true of the branch as it had been. The line actually in the tree still read
+`REGEXP 5xx`, unquoted, which MySQL rejects outright with `ERROR 1054`.
+
+The reviewer had read an earlier state. Nothing in its output said so.
+
+**Check the claim against the file, not against the review.** One `grep` costs
+nothing:
+
+```bash
+git show HEAD:path/to/file | grep -n 'the thing the review says is fixed'
+```
+
+This matters most for code that is *printed* rather than executed — rescue
+commands, runbook snippets, error messages with a command in them. Nothing runs
+them in CI, so a broken one stays broken until the day someone pastes it during
+an incident.
 
 ### Labels are buttons, not states
 
@@ -146,6 +188,18 @@ passes. This is the fastest way to brick your own merge button.
 **Restrict the reviewer with token permissions, not tool patterns.** The reviewer
 job has `contents: read`, so it cannot push regardless of which shell commands it
 is allowed to run. That is a stronger guarantee than an allowlist pattern.
+
+**The Actions token cannot approve a pull request.** Submitting a review with
+`event: APPROVE` comes back `422 — Can not approve your own pull request`, and it
+fails *after* the model has already done the work, so you pay for the review and
+lose the verdict. Post the verdict as a comment and carry the machine-readable
+part in the `agent-review` commit status. That is what branch protection reads
+anyway.
+
+**A push by the bot does not run your other workflows.** Same `GITHUB_TOKEN`
+guard as the loop. If your test suite is a required check, someone has to approve
+the run by hand after each fix commit, or the PR sits with a check that never
+reports. Worth knowing before you wire the merge button to it.
 
 ## Cost
 

@@ -1,0 +1,626 @@
+name: Agent review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled, synchronize, edited]
+
+env:
+  TEST_COMMAND: ""
+  TEST_RUNNER: ""
+  TEST_FILE_GLOB: "tests/*"
+  REVIEW_SETUP_COMMAND: ""
+  SKIP_HEAD_BRANCHES: ""
+  DIFF_LINE_LIMIT: "4000"
+  MODEL_DEFAULT: claude-sonnet-5
+  MODEL_ON_LABEL: claude-opus-5
+
+# A newer pending run replaces an older pending one in the same group, so events
+# that never start a review (other labels, title edits) get a group of their own.
+concurrency:
+  group: >-
+    agent-review-${{ github.event.pull_request.number }}-${{
+      ((github.event.action == 'labeled' && !contains(fromJSON('["ai:review","ai:review-opus"]'), github.event.label.name)) ||
+       (github.event.action == 'edited' && github.event.changes.base == null))
+      && github.run_id || 'review' }}
+  cancel-in-progress: ${{ github.event.action == 'labeled' && contains(fromJSON('["ai:review","ai:review-opus"]'), github.event.label.name) }}
+
+permissions: {}
+
+jobs:
+  gate:
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'edited' || github.event.changes.base != null) &&
+      (github.event.action != 'labeled' || contains(fromJSON('["ai:review","ai:review-opus"]'), github.event.label.name))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      reviewed: ${{ steps.history.outputs.reviewed }}
+      previous_reviews: ${{ steps.history.outputs.previous_reviews }}
+      previous_comments: ${{ steps.history.outputs.previous_comments }}
+    steps:
+      - name: Find earlier reviews by this workflow
+        id: history
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          api_failed=0
+
+          # `gh api --paginate --jq` filters each page separately; slurp all pages first.
+          gh api "repos/$REPO/pulls/$PR/reviews?per_page=100" --paginate \
+            | jq -s '[add[] | select(.user.login == "github-actions[bot]")
+                           | select((.body // "") | contains("<!-- agent-review -->"))]' > .agent-reviews.json \
+            || { echo '[]' > .agent-reviews.json; api_failed=1; }
+          gh api "repos/$REPO/issues/$PR/comments?per_page=100" --paginate \
+            | jq -s '[add[] | select(.user.login == "github-actions[bot]")
+                           | select((.body // "") | contains("<!-- agent-review -->"))]' > .agent-comments.json \
+            || { echo '[]' > .agent-comments.json; api_failed=1; }
+
+          found=$(jq -s 'map(length) | add' .agent-reviews.json .agent-comments.json 2>/dev/null || echo 0)
+          if [ "${found:-0}" -gt 0 ]; then
+            reviewed=yes
+          elif [ "$api_failed" -eq 1 ]; then
+            reviewed=unknown
+          else
+            reviewed=no
+          fi
+
+          {
+            echo "reviewed=$reviewed"
+            echo "previous_reviews=$(jq -r 'map(.id) | join(" ")' .agent-reviews.json 2>/dev/null)"
+            echo "previous_comments=$(jq -r 'map(.id) | join(" ")' .agent-comments.json 2>/dev/null)"
+          } >> "$GITHUB_OUTPUT"
+          echo "reviewed=$reviewed"
+
+      - name: Decide whether this event needs a review
+        id: decide
+        env:
+          ACTION: ${{ github.event.action }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          REVIEWED: ${{ steps.history.outputs.reviewed }}
+        run: |
+          set -euo pipefail
+          run=true
+          reason="review requested by '$ACTION'"
+          for skipped in $SKIP_HEAD_BRANCHES; do
+            if [ "$HEAD_REF" = "$skipped" ]; then
+              run=false
+              reason="head branch '$HEAD_REF' is in SKIP_HEAD_BRANCHES (promotion PR)"
+            fi
+          done
+          if [ "$run" = true ] && [ "$AUTHOR_TYPE" = Bot ] && [ "$ACTION" != labeled ]; then
+            run=false
+            reason="PR opened by a bot; add the ai:review label to review it"
+          fi
+          if [ "$run" = true ] && [ "$ACTION" = synchronize ] && [ "$REVIEWED" != yes ]; then
+            run=false
+            reason="push to a PR that has not been reviewed yet (reviewed=$REVIEWED)"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "run=$run: $reason"
+
+  tests:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      # Toolchain setup for TEST_COMMAND (setup-node, setup-python, ...) goes here.
+
+      - name: Run the test suite
+        run: |
+          set -uo pipefail
+          report=.agent-tests.md
+          if [ -z "$TEST_COMMAND" ]; then
+            printf '%s\n' '# Test suite' '' \
+              'No test suite is configured for this repository (TEST_COMMAND is empty).' \
+              'There are no test results for this commit. Do not claim that tests pass or fail.' > "$report"
+            exit 0
+          fi
+
+          status=0
+          bash -c "$TEST_COMMAND" > "$RUNNER_TEMP/test-output.txt" 2>&1 || status=$?
+          if [ "$status" -eq 0 ]; then result=passed; else result=FAILED; fi
+          {
+            echo '# Test suite on this commit'
+            echo
+            echo "Command: \`$TEST_COMMAND\`"
+            echo "Exit code: $status ($result)"
+            echo
+            echo 'Last 80 lines of output:'
+            echo '```'
+            tail -80 "$RUNNER_TEMP/test-output.txt"
+            echo '```'
+          } > "$report"
+          echo "test suite: $result (exit $status)"
+
+      # upload-artifact skips dotfiles unless include-hidden-files is set.
+      - name: Hand the result to the reviewer
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-tests
+          path: .agent-tests.md
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  review:
+    needs: [gate, tests]
+    if: ${{ !cancelled() && needs.gate.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+      # claude-code-action fails with "Could not fetch an OIDC token" without it.
+      id-token: write
+    env:
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      REVIEWED: ${{ needs.gate.outputs.reviewed }}
+    steps:
+      - name: Mark the commit as under review
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$REPO/statuses/$HEAD_SHA" -f state=pending -f context=agent-review \
+            -f description="Review in progress" >/dev/null
+          if gh api -X DELETE "repos/$REPO/issues/$PR/labels/ai:needs-human" >/dev/null 2>&1; then
+            echo "Removed ai:needs-human left by the previous round."
+          fi
+
+      - name: Mark earlier reviews as outdated
+        if: needs.gate.outputs.reviewed == 'yes'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIOUS_REVIEWS: ${{ needs.gate.outputs.previous_reviews }}
+          PREVIOUS_COMMENTS: ${{ needs.gate.outputs.previous_comments }}
+        run: |
+          set -uo pipefail
+          warning='> [!WARNING]
+          > **Outdated.** Written before the latest commits on this branch; a new review is in progress.'
+
+          prepend_warning() {
+            local kind="$1" api_path="$2" write_method="$3"
+            if ! gh api "$api_path" --jq .body > "$RUNNER_TEMP/old-body.md" 2>/dev/null \
+               || [ ! -s "$RUNNER_TEMP/old-body.md" ]; then
+              echo "Could not read $kind $api_path; leaving it untouched."
+              return
+            fi
+            if head -1 "$RUNNER_TEMP/old-body.md" | grep -qF '[!WARNING]'; then
+              echo "$kind $api_path is already marked outdated."
+              return
+            fi
+            { printf '%s\n\n' "$warning"; cat "$RUNNER_TEMP/old-body.md"; } > "$RUNNER_TEMP/new-body.md"
+            if gh api -X "$write_method" "$api_path" -F body=@"$RUNNER_TEMP/new-body.md" >/dev/null 2>&1; then
+              echo "Marked $kind $api_path as outdated."
+            else
+              echo "Could not update $kind $api_path."
+            fi
+          }
+
+          # A COMMENT review cannot be dismissed; its body is edited with PUT (PATCH returns 404).
+          for id in $PREVIOUS_REVIEWS; do
+            prepend_warning review "repos/$REPO/pulls/$PR/reviews/$id" PUT
+          done
+          for id in $PREVIOUS_COMMENTS; do
+            prepend_warning comment "repos/$REPO/issues/comments/$id" PATCH
+          done
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Keep the review files out of git
+        run: echo '.agent-*' >> .git/info/exclude
+
+      - name: Receive the test suite result
+        id: test_result
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-tests
+
+      - name: Placeholder when there is no test result
+        if: steps.test_result.outcome != 'success'
+        run: |
+          printf '%s\n' '# Test suite' '' \
+            'The test job did not deliver a result (it was skipped or failed before writing one).' \
+            'You do not know whether the tests pass. Say so if it matters for your verdict.' > .agent-tests.md
+          echo "::warning::Reviewing without a test result; check the tests job."
+
+      - name: Prepare the diff
+        run: |
+          set -euo pipefail
+          git diff "origin/$BASE_REF...HEAD" > .agent-diff.patch
+          lines=$(wc -l < .agent-diff.patch | tr -d '[:space:]')
+          echo "diff: $lines lines"
+          if [ "$lines" -gt "$DIFF_LINE_LIMIT" ]; then
+            head -"$DIFF_LINE_LIMIT" .agent-diff.patch > "$RUNNER_TEMP/diff-head.patch"
+            {
+              echo "### WARNING: diff cut to the first $DIFF_LINE_LIMIT of $lines lines. This review is PARTIAL."
+              echo "### Files and hunks after the cut are not visible to you. Say so in the review."
+              echo
+              cat "$RUNNER_TEMP/diff-head.patch"
+            } > .agent-diff.patch
+          fi
+
+      - name: Prepare the previous round
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          out=.agent-previous-round.md
+          if [ "$REVIEWED" = no ]; then
+            echo "This is the FIRST review round of this PR." > "$out"
+            exit 0
+          fi
+
+          unreadable=""
+          fetch() {
+            local name="$1" api_path="$2" filter="$3" dest="$4"
+            if gh api "repos/$REPO/$api_path?per_page=100" --paginate 2>/dev/null \
+                 | jq -rs "$filter" > "$dest" 2>/dev/null; then
+              return 0
+            fi
+            : > "$dest"
+            unreadable="${unreadable}${name}, "
+          }
+
+          fetch "replies from people" "issues/$PR/comments" '
+            add | [.[] | select(.user.type != "Bot")
+                       | select(.author_association | IN("OWNER","MEMBER","COLLABORATOR"))]
+                | sort_by(.created_at)
+                | .[] | "### \(.user.login) · \(.created_at) · \(.html_url)\n\n\(.body)\n"' "$RUNNER_TEMP/replies.md"
+          fetch "replies at lines" "pulls/$PR/comments" '
+            add | [.[] | select(.user.type != "Bot")
+                       | select(.author_association | IN("OWNER","MEMBER","COLLABORATOR"))]
+                | sort_by(.created_at)
+                | .[] | "### \(.user.login) at \(.path):\(.line // .original_line // "?") · \(.created_at)\n\n\(.body)\n"' "$RUNNER_TEMP/line-replies.md"
+          cat "$RUNNER_TEMP/line-replies.md" >> "$RUNNER_TEMP/replies.md"
+          fetch "your last summary" "pulls/$PR/reviews" '
+            add | [.[] | select(.user.login == "github-actions[bot]")
+                       | select((.body // "") | contains("<!-- agent-review -->"))]
+                | sort_by(.submitted_at) | last | .body // empty' "$RUNNER_TEMP/summary.md"
+          fetch "your notes at lines" "pulls/$PR/comments" '
+            add | [.[] | select(.user.login == "github-actions[bot]")]
+                | sort_by(.created_at)
+                | .[] | "### \(.path):\(.line // .original_line // "?")\n\n\(.body)\n"' "$RUNNER_TEMP/notes.md"
+
+          keep_newest() {
+            local file="$1" limit="$2" lines
+            lines=$(wc -l < "$file" | tr -d '[:space:]')
+            [ "$lines" -le "$limit" ] && return 0
+            {
+              echo "(Older entries cut: $lines lines, showing the newest $limit. The first entry below may start mid-way; the full thread is on the PR.)"
+              echo
+              tail -"$limit" "$file"
+            } > "$file.cut"
+            mv "$file.cut" "$file"
+          }
+          keep_newest "$RUNNER_TEMP/replies.md" 400
+          keep_newest "$RUNNER_TEMP/notes.md" 400
+
+          {
+            echo "# Previous review round of this PR"
+            echo
+            echo "The code in \`.agent-diff.patch\` is ALREADY AFTER any fixes made in response to this."
+            if [ "$REVIEWED" = unknown ]; then
+              echo
+              echo "WARNING: it is unknown whether this PR was reviewed before (the GitHub API did not answer)."
+              echo "Do not assume either way."
+            fi
+            echo
+            if [ -n "$unreadable" ]; then
+              echo "WARNING: could not read: ${unreadable%, }. Their absence below does NOT mean they were empty."
+            else
+              echo "Every channel was read; a missing section below was empty."
+            fi
+            echo
+            if [ -s "$RUNNER_TEMP/replies.md" ]; then
+              echo "## Replies from people with write access (they can check what you cannot)"
+              echo
+              cat "$RUNNER_TEMP/replies.md"
+            fi
+            if [ -s "$RUNNER_TEMP/summary.md" ]; then
+              echo "## Your summary from the previous round"
+              echo
+              cat "$RUNNER_TEMP/summary.md"
+              echo
+            fi
+            if [ -s "$RUNNER_TEMP/notes.md" ]; then
+              echo "## Your notes at lines from previous rounds"
+              echo
+              cat "$RUNNER_TEMP/notes.md"
+            fi
+          } > "$out"
+          echo "previous round: $(wc -l < "$out" | tr -d '[:space:]') lines, unreadable: ${unreadable:-none}"
+
+      # Runs in a job holding a write token: it must not execute code from the PR
+      # (use npm ci --ignore-scripts, composer install --no-scripts --no-plugins).
+      - name: Dependencies for single-test runs
+        if: env.TEST_RUNNER != '' && env.REVIEW_SETUP_COMMAND != ''
+        run: bash -c "$REVIEW_SETUP_COMMAND"
+
+      - name: Install the single-test wrapper
+        id: wrapper
+        run: |
+          set -euo pipefail
+          wrapper_dir="$RUNNER_TEMP/agent-review"
+          if [ -z "$TEST_RUNNER" ]; then
+            echo "note=You cannot run any command: no test runner is configured for this repository." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f .github/scripts/review-test-install.sh ]; then
+            echo "::warning::TEST_RUNNER is set but .github/scripts/review-test-install.sh is missing; the reviewer cannot run tests."
+            echo "note=You cannot run any command: the test wrapper is not installed in this repository." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bash .github/scripts/review-test-install.sh "$wrapper_dir"
+          echo "note=You can run ONE committed test file: bash $wrapper_dir/review-run-test.sh <path matching $TEST_FILE_GLOB>" >> "$GITHUB_OUTPUT"
+
+      - name: Pick the model
+        id: model
+        env:
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          if [ "$LABEL" = ai:review-opus ]; then
+            echo "id=$MODEL_ON_LABEL" >> "$GITHUB_OUTPUT"
+          else
+            echo "id=$MODEL_DEFAULT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Review
+        id: review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Without an explicit token the action exchanges one through the Claude
+          # GitHub App and fails with 401 when the App is not installed.
+          github_token: ${{ github.token }}
+          # An unquoted space inside --allowedTools splits the list; quote such entries.
+          # Edit(/.agent-*) limits the Write tool to root-level .agent-* files.
+          claude_args: |
+            --model ${{ steps.model.outputs.id }}
+            --max-turns 60
+            --allowedTools Read,Glob,Grep,Edit(/.agent-*),"Bash(bash ${{ runner.temp }}/agent-review/review-run-test.sh:*)"
+            --disallowedTools WebFetch,WebSearch
+          prompt: |
+            You are the quality gate for PR #${{ github.event.pull_request.number }} (target branch: ${{ github.event.pull_request.base.ref }}).
+            You review; you never change the code. Your review goes straight to a person.
+
+            ## What you have
+
+            - `.agent-diff.patch`: the whole diff of this PR, already computed. READ IT FIRST and review
+              only what is in it. Open other files only for context around a changed line.
+            - `.agent-previous-round.md`: your previous review of this PR and people's replies. Read it second.
+            - `.agent-tests.md`: the result of the project's test suite on this commit, computed before you
+              started. Do not ask anyone to run the suite; the result is here, or the file says there is none.
+              Red tests do not excuse you from reviewing: report them as a finding and review the change anyway.
+            - ${{ steps.wrapper.outputs.note }}
+              The wrapper takes exactly one path, no flags, and runs only files committed in this PR's
+              branch, in an untouched tree. Use it to test a concrete hypothesis, not to rerun the suite.
+              Do not try to work around it: the restriction is deliberate.
+
+            OPEN THESE FILES BY NAME. Their names start with a dot and they are git-ignored, so directory
+            search and Glob do not list them. "Not found" from a search means you did not look; give the
+            path explicitly, also when you Grep inside them.
+
+            You have no git, no network, no shell beyond the wrapper above, no production data and no
+            code of third-party dependencies that is not in this repository. You can write only files
+            named `.agent-*` in the repository root.
+
+            ## Previous round
+
+            The code in the diff is ALREADY AFTER the fixes made in response to the previous round.
+            1. Check that each fix does what was asked: read the code, not the author's claim.
+            2. Check that the fix did not change the meaning of something next to it (a label, a count,
+               a message that now describes the old behaviour).
+            3. Do not repeat findings that are resolved. Stay silent about them.
+            4. A "To verify locally" point that a person answered with a measurement is closed. Challenge it
+               only if the measurement does not answer the question, and say what is missing.
+
+            ## What counts as a finding
+
+            Things that will actually break: logic errors and edge cases on real data; security (unvalidated
+            input, queries built from strings, leaked secrets); regressions in whatever this codebase treats
+            as a critical path; errors swallowed silently. Skip style, formatting and naming: linters do that.
+
+            Every finding MUST have a concrete failure scenario: which input leads to which bad outcome.
+            No scenario, no finding. An empty list is a valid result and better than a list of guesses.
+            Nobody filters your false alarms before a person reads them; each one costs that person time.
+
+            A FINDING IS A PATTERN. Before you write one up, name its shape ("the calculation changed but the
+            label next to it still describes the old one", "a new condition added to one branch but not the
+            other") and search `.agent-diff.patch` for every other place with the same shape. List ALL
+            occurrences, each with its own line note, and say in the summary it is one pattern in N places.
+            If you searched and it is the only one, say that too. Authors fix exactly what you point at.
+
+            ## What you cannot see
+
+            Do not guess what you cannot check: values in production data or settings, schemas and field
+            names of third-party code, how an external service behaves. Never state such a name or value from
+            memory. When a suspected problem depends on something outside your reach, put it under
+            "To verify locally", not among the findings.
+
+            ## Output: exactly three files in the repository root
+
+            `.agent-verdict`: one word.
+              PASS  - nothing here will break.
+              FAIL  - at least one finding.
+              HUMAN - a design or business decision a machine should not make (not a defect: a defect is
+                      FAIL). Ask ONE concrete question in the summary.
+              PASS must not hide an unverified point: if confirming a "To verify locally" item would turn
+              your verdict into FAIL, the verdict is HUMAN. A point that changes nothing whatever the result
+              leaves PASS as it is.
+
+            `.agent-review.md`: short. The reader sees the diff: do not summarise what the PR changes, do not
+            list files, do not narrate what you checked. At most 4 sentences of prose; numbered lists do not
+            count toward that limit. Sections, in this order, each only when it has content:
+
+              One or two sentences: the verdict and why.
+
+              **Findings** - numbered, one line each (title only; details go in the line notes), so a person
+              can refer to them by number.
+
+              **To verify locally** - numbered. Each item: what you suspect, what exactly to check (a query,
+              a command, a file), and which result means there is a problem.
+
+              **Another angle** - at most 3 bullets, only when concrete: an alternative approach, or a risk
+              the author most likely did not consider, and what it would change. Omit the section otherwise.
+
+              **Untested scenarios** - numbered, one line each: `input or situation -> expected outcome`,
+              for cases the tests in this PR do not cover (edge values, empty or invalid input, error paths,
+              concurrency, retries, permissions). Only cases that matter for this change; no generic lists.
+
+            `.agent-notes.json`: the details, pinned to lines. Pure JSON, nothing else (no ``` fence):
+              [{"path":"src/file.js","line":42,"side":"RIGHT","body":"..."}]
+              - `line` is a bare number of a line visible in the diff; `side` is RIGHT for added or kept
+                lines, LEFT for removed lines.
+              - `body`: what breaks and on which input, then what to change (a code snippet if it helps).
+                Escape newlines as \n and quotes as \".
+              - A finding without a single line goes to `.agent-review.md` instead. No notes: `[]`.
+              - If you are not sure the file is valid JSON, write `[]` and move the content to the review.
+
+            Do not try to comment on the PR yourself: you have no access, and the workflow publishes these
+            files. A run that ends without all three files counts as a failed review.
+
+      - name: Publish the review
+        id: publish
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          marker='<!-- agent-review -->'
+
+          retry() {
+            local attempt=1
+            until "$@" >/dev/null 2>&1; do
+              [ "$attempt" -lt 3 ] || return 1
+              sleep $((attempt * 5))
+              attempt=$((attempt + 1))
+            done
+          }
+
+          verdict=$(tr -d '[:space:]' < .agent-verdict 2>/dev/null || true)
+          case "$verdict" in PASS|FAIL|HUMAN) ;; *) verdict=NONE ;; esac
+
+          if [ ! -s .agent-review.md ]; then
+            {
+              printf '%s\n' "$marker"
+              printf '**Agent review did not finish** for commit %s: no review was written. See the [run log](%s). The **agent-review** status is red; add the **ai:review** label to try again.\n' "$HEAD_SHA" "$RUN_URL"
+            } > "$RUNNER_TEMP/no-review.md"
+            if retry gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/no-review.md"; then
+              echo "no review file; reported on the PR"
+              exit 0
+            fi
+            echo "no review file, and the report could not be posted"
+            exit 1
+          fi
+
+          notes_rejected=0
+          [ -s .agent-notes.json ] || echo '[]' > .agent-notes.json
+          if ! jq -e 'type == "array" and all(.[]; type == "object" and (.path | type) == "string"
+                        and (.line | type) == "number" and (.body | type) == "string")' .agent-notes.json >/dev/null 2>&1; then
+            notes_rejected=1
+            echo "::warning::.agent-notes.json is not a valid list of notes; publishing without line notes"
+            head -40 .agent-notes.json || true
+            echo '[]' > .agent-notes.json
+          fi
+
+          {
+            printf '%s\n' "$marker"
+            printf '**Agent review** · verdict: **%s** · commit %s\n\n' "$verdict" "${HEAD_SHA:0:7}"
+            if [ "$verdict" = HUMAN ]; then
+              printf '> [!IMPORTANT]\n> **A person has to decide this one.** The question is in the review below.\n\n'
+            fi
+            cat .agent-review.md
+            if [ "$notes_rejected" = 1 ]; then
+              printf '\n\n---\n_The line notes were dropped: the agent wrote invalid JSON. Details are in the [run log](%s)._\n' "$RUN_URL"
+            fi
+          } > "$RUNNER_TEMP/body.md"
+
+          jq -n --rawfile body "$RUNNER_TEMP/body.md" --slurpfile notes .agent-notes.json --arg sha "$HEAD_SHA" \
+            '{event: "COMMENT", commit_id: $sha, body: $body,
+              comments: ($notes[0] | map({path, line, side: (.side // "RIGHT"), body}))}' > "$RUNNER_TEMP/review.json"
+          jq -n --rawfile body "$RUNNER_TEMP/body.md" --arg sha "$HEAD_SHA" \
+            '{event: "COMMENT", commit_id: $sha, body: $body}' > "$RUNNER_TEMP/review-no-notes.json"
+
+          # GitHub rejects the whole review when one line number is outside the diff.
+          if retry gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/review.json"; then
+            echo "review published with $(jq length .agent-notes.json) line notes"
+          elif retry gh api "repos/$REPO/pulls/$PR/reviews" --input "$RUNNER_TEMP/review-no-notes.json"; then
+            echo "::warning::line notes rejected (most likely a line outside the diff); review published without them"
+          elif retry gh pr comment "$PR" --repo "$REPO" --body-file "$RUNNER_TEMP/body.md"; then
+            echo "::warning::review API unavailable; verdict posted as a plain comment"
+          else
+            echo "review could not be published by any channel"
+            exit 1
+          fi
+
+          if [ "$verdict" = HUMAN ]; then
+            if retry gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=ai:needs-human"; then
+              echo "label ai:needs-human added"
+            else
+              echo "::warning::could not add the ai:needs-human label"
+            fi
+          fi
+
+      - name: Set the agent-review status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED: ${{ steps.publish.outcome }}
+        run: |
+          set -euo pipefail
+          verdict=$(tr -d '[:space:]' < .agent-verdict 2>/dev/null || true)
+          if [ "$PUBLISHED" != success ]; then
+            state=failure; description="The review was not published"
+          elif [ ! -s .agent-review.md ]; then
+            state=failure; description="The review did not finish"
+          elif [ "$verdict" = PASS ]; then
+            state=success; description="No blocking problems found"
+          elif [ "$verdict" = HUMAN ]; then
+            state=failure; description="HUMAN: a person has to decide"
+          elif [ "$verdict" = FAIL ]; then
+            state=failure; description="Findings to address"
+          else
+            state=failure; description="No verdict written"
+          fi
+          gh api "repos/$REPO/statuses/$HEAD_SHA" -f state="$state" -f context=agent-review \
+            -f description="$description" >/dev/null
+          echo "agent-review: $state ($description)"
+
+      - name: Remove the trigger label so it can be clicked again
+        if: always() && github.event.action == 'labeled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ github.event.label.name }}
+        run: |
+          if gh api -X DELETE "repos/$REPO/issues/$PR/labels/$LABEL" >/dev/null 2>&1; then
+            echo "removed $LABEL"
+          fi

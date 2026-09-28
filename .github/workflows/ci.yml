@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.11/scripts/download-actionlint.bash) 1.7.11
+          sudo mv actionlint /usr/local/bin/
+
+      - name: actionlint
+        run: actionlint workflows/*.yml .github/workflows/*.yml
+
+      - name: shellcheck on scripts
+        run: shellcheck --severity=style setup-labels.sh scripts/*.sh tests/*.sh
+
+      - name: shellcheck on run blocks
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --user pyyaml
+          bash tests/lint-run-blocks.sh
+
+      - name: Wrapper refuses what it must
+        run: bash tests/run-test-wrapper.sh
+
+      - name: Workflow steps decide correctly
+        run: bash tests/workflow-steps.sh
+
+      - name: Every guard and decision is covered by a test
+        run: bash tests/mutation-check.sh
